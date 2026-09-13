@@ -1065,11 +1065,11 @@ fn read_v2_source_state(v2_root: &Path) -> Result<Option<V2SourceStateValue>> {
 
 fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()> {
     let path = v2_source_state_path(v2_root);
-    // Only the Unix arm below re-checks the opened descriptor against this;
-    // the validation and the writability probe inside still have to run
-    // everywhere, so the binding stays and only its use is platform-specific.
-    #[cfg_attr(not(unix), allow(unused_variables))]
-    let initial_metadata =
+    // `None` when the entry does not exist yet, which also selects the
+    // exclusive-create flag below. When it does exist, both platforms hold it
+    // to this identity across the open, so a same-name replacement landing in
+    // between is refused rather than silently written through.
+    let initial_identity =
         if session_path_entry_exists(&path).map_err(|err| Error::Io(Box::new(err)))? {
             let metadata = std::fs::symlink_metadata(&path)?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1079,7 +1079,7 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
                 ));
             }
             ensure_session_file_writable(&path).map_err(|err| Error::Io(Box::new(err)))?;
-            Some(metadata)
+            Some(crate::file_identity::FileIdentity::of_path_nofollow(&path)?)
         } else {
             ensure_session_parent_writable(&path).map_err(|err| Error::Io(Box::new(err)))?;
             None
@@ -1090,8 +1090,6 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-
         let directory = rustix::fs::open(
             v2_root,
             rustix::fs::OFlags::RDONLY
@@ -1101,7 +1099,7 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
             rustix::fs::Mode::empty(),
         )
         .map_err(std::io::Error::from)?;
-        let create_flags = if initial_metadata.is_some() {
+        let create_flags = if initial_identity.is_some() {
             rustix::fs::OFlags::empty()
         } else {
             rustix::fs::OFlags::EXCL
@@ -1119,10 +1117,9 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
         .map_err(std::io::Error::from)?;
         let mut file = std::fs::File::from(descriptor);
         let opened_metadata = file.metadata()?;
+        let opened_identity = crate::file_identity::FileIdentity::of_open_file(&file)?;
         if !opened_metadata.is_file()
-            || initial_metadata.as_ref().is_some_and(|initial| {
-                initial.dev() != opened_metadata.dev() || initial.ino() != opened_metadata.ino()
-            })
+            || initial_identity.is_some_and(|initial| initial != opened_identity)
         {
             return Err(invalid_v2_source_state(
                 &path,
@@ -1148,10 +1145,18 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
             .write(true)
             .truncate(true)
             .open(&path)?;
-        if !file.metadata()?.is_file() {
+        let opened_identity = crate::file_identity::FileIdentity::of_open_file(&file)?;
+        // The same re-check the Unix arm performs: without it a same-name
+        // replacement landing between the validation above and this open was
+        // written through unnoticed (bd-vr2b8). A reparse point substituted
+        // here fails it too, because the recorded identity was read without
+        // following one while this open does.
+        if !file.metadata()?.is_file()
+            || initial_identity.is_some_and(|initial| initial != opened_identity)
+        {
             return Err(invalid_v2_source_state(
                 &path,
-                "opened state entry is not a regular file",
+                "state entry changed while it was being opened",
             ));
         }
         file.write_all(&encoded)?;
