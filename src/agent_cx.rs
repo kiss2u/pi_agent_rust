@@ -204,6 +204,61 @@ mod tests {
     }
 
     #[test]
+    fn inherited_context_preserves_restrictions_budget_and_owner_cancellation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime");
+        let budget = Budget::new().with_poll_quota(8);
+        let owner = runtime.request_cx_with_budget(budget);
+
+        runtime.block_on(async {
+            let parent = Cx::current().expect("runtime installs its context");
+            let parent_caps = parent.capabilities();
+            let captured = {
+                let restricted = owner.restrict::<asupersync::cx::cap::None>();
+                let _guard = restricted.set_current_restricted();
+                let ambient = Cx::current().expect("restricted context remains present");
+                let cx = AgentCx::for_current_or_request();
+                let caps = cx.capabilities();
+                assert_eq!(caps, ambient.capabilities());
+                assert!(!caps.spawn && !caps.time && !caps.entropy && !caps.io && !caps.remote);
+                assert_eq!(cx.budget(), budget);
+
+                // The explicit constructor must preserve the same attenuated context.
+                let wrapped = AgentCx::from_cx(cx.cx().clone());
+                assert_eq!(wrapped.capabilities(), caps);
+                assert_eq!(wrapped.budget(), budget);
+                wrapped
+            };
+            assert_eq!(
+                Cx::current().expect("parent restored").capabilities(),
+                parent_caps
+            );
+
+            // Exercise the real cancel-aware lock used at Pi's session boundaries.
+            let state = asupersync::sync::Mutex::new(7_u32);
+            {
+                let mut guard = state.lock(captured.cx()).await.expect("live owner admitted");
+                *guard += 1;
+            }
+            let captured_caps = captured.capabilities();
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("owner cancelled"));
+            assert!(matches!(
+                state.lock(captured.cx()).await,
+                Err(asupersync::sync::LockError::Cancelled)
+            ));
+            assert_eq!(*state.try_lock().expect("cancelled lock released"), 8);
+            assert_eq!(captured.capabilities(), captured_caps);
+            assert_eq!(captured.budget(), budget);
+            assert!(!parent.is_cancel_requested());
+            assert_eq!(
+                Cx::current().expect("parent retained").capabilities(),
+                parent_caps
+            );
+        });
+    }
+
+    #[test]
     fn for_testing_creates_valid_context() {
         let cx = AgentCx::for_testing();
         let _ = cx.cx();
