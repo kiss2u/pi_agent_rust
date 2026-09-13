@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! SDK integration test suite (bd-2hcex: PARITY-V3).
 //!
 //! Validates that the programmatic SDK API (`pi::sdk`) works correctly:

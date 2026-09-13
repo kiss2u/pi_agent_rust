@@ -6,6 +6,10 @@
 //! - Distribution through one supported end-user binary in official release archives
 
 #![forbid(unsafe_code)]
+// The binary is its own crate, so src/lib.rs's `recursion_limit` does not
+// reach it; asupersync 0.5.0 nests its runtime future types deeply enough that
+// proving `Send` for `run()` exceeds the default 128.
+#![recursion_limit = "256"]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;

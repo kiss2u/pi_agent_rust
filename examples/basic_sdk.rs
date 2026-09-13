@@ -1,3 +1,9 @@
+// Examples are separate crates, so src/lib.rs's `recursion_limit` does not
+// reach here; asupersync 0.5.0 nests its runtime future types deeply enough
+// that proving `Send` exceeds the default 128. An SDK embedder hitting this in
+// their own crate needs the same attribute.
+#![recursion_limit = "256"]
+
 //! Basic SDK example: create an agent session and send a prompt programmatically.
 //!
 //! This demonstrates how to embed Pi as a library crate rather than using the CLI.

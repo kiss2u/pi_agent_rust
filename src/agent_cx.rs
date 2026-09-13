@@ -238,7 +238,10 @@ mod tests {
             // Exercise the real cancel-aware lock used at Pi's session boundaries.
             let state = asupersync::sync::Mutex::new(7_u32);
             {
-                let mut guard = state.lock(captured.cx()).await.expect("live owner admitted");
+                let mut guard = state
+                    .lock(captured.cx())
+                    .await
+                    .expect("live owner admitted");
                 *guard += 1;
             }
             let captured_caps = captured.capabilities();
