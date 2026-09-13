@@ -135,10 +135,13 @@ while true; do
       echo >&2
       echo "error: no output for $((STALL_POLLS * POLL_SECONDS))s; last line was:" >&2
       echo "       ${last}" >&2
-      echo "       If that mentions a file lock, something else on ${HOST} owns" >&2
-      echo "       a cargo build. Check for a stuck task:" >&2
-      echo "         ssh ${HOST} 'powershell -NoProfile -Command \"Get-ScheduledTask -TaskName pi-* | Select TaskName,State\"'" >&2
-      echo "       and end it with schtasks /end /tn <name>." >&2
+      echo "       A file lock there means another cargo on ${HOST} owns the" >&2
+      echo "       directory. Note that 'schtasks /end' ends the task but" >&2
+      echo "       leaves its cargo child running, so an abandoned run keeps" >&2
+      echo "       the lock until that process is killed. List the owners:" >&2
+      echo "         ssh ${HOST} 'powershell -NoProfile -Command \"Get-CimInstance Win32_Process | ? { \\\$_.Name -eq \\\"cargo.exe\\\" } | %% { \\\"{0} {1}\\\" -f \\\$_.ProcessId, \\\$_.CommandLine }\"'" >&2
+      echo "       Match on the command line before killing anything: this host" >&2
+      echo "       builds other projects too." >&2
       exit 3
     fi
   else
