@@ -72,8 +72,16 @@ batch="$workdir/gate.cmd"
   printf 'git fetch origin >> "%%LOG%%" 2>&1\r\n'
   printf 'git checkout -f %%COMMIT%% >> "%%LOG%%" 2>&1\r\n'
   printf 'git rev-parse HEAD >> "%%LOG%%" 2>&1\r\n'
+  # Best-effort only: the in-repo .cargo/config.toml pins rust-lld, so neither
+  # `check` nor `clippy` needs the MSVC linker on PATH. Both `call`s printing
+  # "The system cannot find the path specified" is normal on a host without
+  # Visual Studio and must not stop the run.
   printf 'call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat" >> "%%LOG%%" 2>&1\r\n'
   printf 'if errorlevel 1 call "C:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat" >> "%%LOG%%" 2>&1\r\n'
+  # A failed `call` leaves errorlevel set, and nothing between here and the
+  # first cargo invocation clears it. Reset it so the step checks below report
+  # their own command rather than inheriting this one.
+  printf 'cmd /c "exit /b 0"\r\n'
   # rch's cargo shim would try to ship this to a Linux worker.
   printf 'set RCH_DISABLED=1\r\n'
   printf 'set RCH_CARGO_WRAPPER_BYPASS=1\r\n'
@@ -82,12 +90,23 @@ batch="$workdir/gate.cmd"
   # the host means blocking on its lock for however long that build runs, and
   # a leftover process from an abandoned run can hold it indefinitely.
   printf 'set CARGO_TARGET_DIR=%%ROOT%%\\target-windows-gate\r\n'
+  # Every step records its own exit code. A run that dies between steps then
+  # shows up as a missing marker rather than as a log that simply stops, which
+  # is what made an earlier failure here impossible to diagnose from the log.
   printf 'echo ==== cargo check --all-targets >> "%%LOG%%"\r\n'
   printf 'cargo check --locked --all-targets --target x86_64-pc-windows-msvc --message-format short >> "%%LOG%%" 2>&1\r\n'
-  printf 'if errorlevel 1 (echo === exit=1 CHECK FAILED >> "%%LOG%%" & exit /b 1)\r\n'
+  printf 'set CHECK_STATUS=%%ERRORLEVEL%%\r\n'
+  printf 'echo ==== check exit=%%CHECK_STATUS%% >> "%%LOG%%"\r\n'
+  printf 'if not "%%CHECK_STATUS%%"=="0" (\r\n'
+  printf '  echo === exit=%%CHECK_STATUS%% >> "%%LOG%%"\r\n'
+  printf '  endlocal\r\n'
+  printf '  exit /b 1\r\n'
+  printf ')\r\n'
   printf 'echo ==== cargo clippy --all-targets -D warnings >> "%%LOG%%"\r\n'
   printf 'cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc --message-format short -- -D warnings >> "%%LOG%%" 2>&1\r\n'
-  printf 'echo === exit=%%ERRORLEVEL%% >> "%%LOG%%"\r\n'
+  printf 'set CLIPPY_STATUS=%%ERRORLEVEL%%\r\n'
+  printf 'echo ==== clippy exit=%%CLIPPY_STATUS%% >> "%%LOG%%"\r\n'
+  printf 'echo === exit=%%CLIPPY_STATUS%% >> "%%LOG%%"\r\n'
   printf 'endlocal\r\n'
 } > "$batch"
 
@@ -125,6 +144,20 @@ while true; do
   last="$(ssh -o ConnectTimeout=25 "$HOST" \
     "tr '\\r' '\\n' < '${remote_log_posix}' | grep -v '^[[:space:]]*\$' | tail -1" 2>/dev/null || true)"
   printf '  ... %s\n' "${last:-(no output yet)}"
+
+  # The task going Ready without an `=== exit` marker means the batch died
+  # between steps. Waiting for a verdict that can no longer arrive just burns
+  # the operator's time, so fail immediately with what the log does have.
+  task_state="$(run_remote "(Get-ScheduledTask -TaskName '${TASK_NAME}').State" | tr -d '\r' | tr -d ' ')"
+  if [ "$task_state" = "Ready" ]; then
+    echo >&2
+    echo "error: the task on ${HOST} finished without recording a verdict." >&2
+    echo "       Last markers:" >&2
+    ssh -o ConnectTimeout=25 "$HOST" \
+      "tr -d '\\r' < '${remote_log_posix}' | grep -E '^====|^=== exit' | tail -10" >&2 2>/dev/null || true
+    echo "       full log: ${HOST}:${remote_log_win}" >&2
+    exit 4
+  fi
 
   # A run that stops producing output is usually waiting on another cargo's
   # lock — most often a leftover process from an abandoned run on the host.
