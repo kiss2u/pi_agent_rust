@@ -664,6 +664,58 @@ fn coalescer_recording_payload(
     }))
 }
 
+/// Gate a burst so every dispatch is enqueued before the first one resolves.
+///
+/// The coalescing count is only "the first and the latest" when the whole
+/// burst lands while that first dispatch is still in flight. Left to wall
+/// time, a loaded machine completes the in-flight crossing partway through
+/// and picks up intermediate payloads — which is a property of the scheduler,
+/// not of the contract, and made this test flaky on the gate workers
+/// (bd-d158o). Holding resolution on an explicit gate makes the window a fact
+/// rather than a race.
+///
+/// The wait is bounded so a scheduling model that resolves inline degrades to
+/// the old timing-dependent behaviour instead of hanging the suite.
+fn coalescer_gated_recording_payload(
+    sequence: usize,
+    resolved: &Arc<Mutex<Vec<usize>>>,
+    gate: &Arc<(Mutex<bool>, std::sync::Condvar)>,
+) -> CoalescedPayload {
+    let resolved = Arc::clone(resolved);
+    let gate = Arc::clone(gate);
+    CoalescedPayload::Lazy(Box::new(move || {
+        let (open_lock, opened) = &*gate;
+        let mut open = open_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*open {
+            let (guard, timeout) = opened
+                .wait_timeout(open, Duration::from_secs(10))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            open = guard;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+        drop(open);
+
+        resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sequence);
+        Some(json!({ "sequence": sequence }))
+    }))
+}
+
+/// Release a gate created for [`coalescer_gated_recording_payload`].
+fn open_coalescer_gate(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+    let (open_lock, opened) = &**gate;
+    *open_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    opened.notify_all();
+}
+
 fn assert_coalescer_idle(coalescer: &EventCoalescer) {
     assert!(
         coalescer
@@ -1344,6 +1396,10 @@ mod proptest_dispatch {
             offset in 0u32..4096,
             limit in 1u32..2048,
         ) {
+            // Held for the same reason as the two arena cases below: each
+            // `marshal` appends to the process-wide superinstruction trace
+            // window, and a proptest marshals hundreds of times.
+            let _guard = superinstruction_test_lock();
             let mut input_a = serde_json::Map::new();
             input_a.insert("path".to_string(), json!(path));
             input_a.insert("offset".to_string(), json!(offset));
@@ -2458,6 +2514,12 @@ mod hostcall_protocol_equivalence {
 
     #[test]
     fn arena_without_opcode_uses_canonical_generic_path() {
+        // `marshal` feeds the process-wide superinstruction trace window, so
+        // every caller has to take this lock even when it does not care about
+        // superinstructions: otherwise it interleaves foreign traces into the
+        // window `reactor.rs`'s warmup tests are measuring support over, and
+        // those fail only under parallel load (bd-d158o).
+        let _guard = superinstruction_test_lock();
         let params = serde_json::json!({ "url": "https://example.invalid/pick" });
         let artifacts = HostcallPayloadArena::new("http", &params, None).marshal();
         assert_eq!(
@@ -2474,6 +2536,8 @@ mod hostcall_protocol_equivalence {
 
     #[test]
     fn arena_shape_miss_falls_back_to_canonical_with_reason() {
+        // See the note above: any `marshal` caller must hold this.
+        let _guard = superinstruction_test_lock();
         // The ToolRead fast path requires exactly {"name", "input"}; anything
         // else must miss the shape and fall back without hashing divergence.
         let params = serde_json::json!({ "unexpected": true });
@@ -2577,14 +2641,18 @@ fn event_coalescer_burst_resolves_only_the_first_and_the_latest_payload() {
     let manager = coalescer_test_manager_with_hooks(&[ExtensionEventName::MessageUpdate]);
     let coalescer = EventCoalescer::new(manager);
     let resolved = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
 
     for sequence in 1..=BURST {
         coalescer.dispatch_fire_and_forget(
             ExtensionEventName::MessageUpdate,
-            coalescer_recording_payload(sequence, &resolved),
+            coalescer_gated_recording_payload(sequence, &resolved, &gate),
             &handle,
         );
     }
+    // Every dispatch is now either in flight or the single surviving pending
+    // payload, so what resolves from here is the contract and not a race.
+    open_coalescer_gate(&gate);
 
     runtime.block_on(async {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
