@@ -187,15 +187,29 @@ echo
 echo "$status"
 echo
 
+# `grep -c` exits 1 when the count is zero, so the fallback has to live inside
+# the remote command; otherwise a clean run appends a second "0" and the
+# comparison below sees a two-line string.
 errors="$(ssh -o ConnectTimeout=25 "$HOST" \
-  "tr -d '\\r' < '${remote_log_posix}' | grep -cE ': error|error\\[' " 2>/dev/null || echo 0)"
-exit_line="$(printf '%s' "$status" | grep '^=== exit' | tail -1)"
+  "tr -d '\\r' < '${remote_log_posix}' | grep -cE ': error|error\\[' || true" 2>/dev/null \
+  | tr -cd '0-9')"
+errors="${errors:-0}"
 
-if [ "$errors" -eq 0 ] && printf '%s' "$exit_line" | grep -q 'exit=0'; then
+# The `=== exit=N` marker the batch writes is the authoritative verdict; the
+# diagnostic count is a cross-check for a run that somehow exits 0 with errors
+# in the log.
+exit_line="$(printf '%s\n' "$status" | grep '^=== exit' | tail -1)"
+
+if printf '%s' "$exit_line" | grep -q 'exit=0' && [ "$errors" -eq 0 ]; then
   echo "PASS: Windows target compiles and lints clean at $commit"
   exit 0
 fi
 
-echo "FAIL: Windows target is not clean at $commit ($errors diagnostic line(s))" >&2
+if [ -z "$exit_line" ]; then
+  echo "FAIL: no verdict recorded for $commit" >&2
+else
+  echo "FAIL: Windows target is not clean at $commit" >&2
+  echo "      ${exit_line}, ${errors} diagnostic line(s)" >&2
+fi
 echo "      full log: ${HOST}:${remote_log_win}" >&2
 exit 1
