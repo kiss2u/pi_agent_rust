@@ -313,6 +313,21 @@ release objective.
 2) **Update version** in `Cargo.toml` (`[package].version`).
 3) **Run the configured DSR quality gate**:
    - `dsr quality --tool pi_agent_rust`
+3b) **Check the Windows target, before the release commit exists** (bd-o6hte):
+   - `scripts/check_windows_target.sh <commit>` — the commit must already be
+     pushed; the Windows host fetches it.
+   - This runs `cargo check --all-targets` and `cargo clippy --all-targets --
+     -D warnings` for `x86_64-pc-windows-msvc`. The DSR gate does **not**: it
+     builds only the rch worker's own triple, and this repository runs no CI,
+     so nothing else notices when Windows stops compiling.
+   - It has stopped compiling before and gone unnoticed for two minor
+     versions. v0.5.0 found the crate had not built for Windows since some
+     point after v0.3.0 — discovered at the release build, after the release
+     commit and tag already existed, which cost a full rebuild of all five
+     platforms and a re-tag. v0.5.1 then found the target still broken under
+     `--all-targets`, along with three real Windows defects.
+   - Budget ~25 minutes warm, over an hour cold. Do this **before** step 5 so
+     a failure costs a commit rather than a release.
 4) **Update changelog**:
    - `br changelog --since-tag vX.Y.Z` (or use `--since YYYY-MM-DD` if no prior tags)
    - paste the output into `CHANGELOG.md` under a new version heading
